@@ -1,0 +1,49 @@
+name: Actualizar dashboards
+
+on:
+  schedule:
+    # GitHub Actions usa UTC. Se ejecuta 6 veces al día, cada 4 horas.
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-dashboards
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Generar dashboards
+        run: python sofa.py --once
+
+      - name: Publicar cambios generados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.html rachas.html
+          if git diff --cached --quiet; then
+            echo "No hay cambios para publicar."
+          else
+            git commit -m "chore: actualizar dashboards"
+            git push
+          fi

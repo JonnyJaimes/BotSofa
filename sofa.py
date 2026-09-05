@@ -4,6 +4,7 @@ import json
 import random
 import logging
 import datetime
+import argparse
 from threading import Semaphore
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests
@@ -392,8 +393,19 @@ def ejecutar_pipeline():
     generar_vistas_html(partidos_top, partidos_rachas)
 
 if __name__ == "__main__":
-    INTERVALO_MINUTOS = 45
-    while True:
+    parser = argparse.ArgumentParser(description="Actualiza los dashboards de SofaScore.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Ejecuta un ciclo y termina; útil para GitHub Actions.",
+    )
+    args = parser.parse_args()
+
+    INTERVALO_MINUTOS = 240
+    if args.once:
         ejecutar_pipeline()
-        logging.info(f"Ciclo finalizado. Esperando {INTERVALO_MINUTOS} minutos...")
-        time.sleep(INTERVALO_MINUTOS * 60)
+    else:
+        while True:
+            ejecutar_pipeline()
+            logging.info(f"Ciclo finalizado. Esperando {INTERVALO_MINUTOS} minutos...")
+            time.sleep(INTERVALO_MINUTOS * 60)
