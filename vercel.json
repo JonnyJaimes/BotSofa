@@ -1,10 +1,20 @@
 {
   "version": 2,
   "cleanUrls": true,
-  "rewrites": [
+  "builds": [
+    {
+      "src": "dashboard.html",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "rachas.html",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
     {
       "source": "/",
-      "destination": "/dashboard.html"
+      "dest": "/dashboard.html"
     }
   ]
 }
