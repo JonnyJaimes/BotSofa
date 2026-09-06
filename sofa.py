@@ -5,6 +5,7 @@ import random
 import logging
 import datetime
 import argparse
+import os
 from threading import Semaphore
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests
@@ -23,12 +24,38 @@ HEADERS = {
 }
 
 # Control de Tasa Global (RPS)
-SEMAFORO_RED = Semaphore(3)  # Máximo 3 peticiones concurrentes simultáneas
+SEMAFORO_RED = Semaphore(3)
 CACHE_EVENTOS_FILE = "cache_eventos.json"
-CACHE_HISTORIAL_USUARIOS = {}  # {user_id: {"timestamp": ts, "data": stats}}
+CACHE_HISTORIAL_USUARIOS = {}
 TTL_HISTORIAL_HORAS = 3
 
-# --- 1. CAPA DE RED RESILIENTE Y CACHÉ PERSISTENTE ---
+# Configuración de Telegram (Usa variables de entorno o valores por defecto)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8901055148:AAHea7F6UjSJ8jSnpluKyAsQHoOAxwjb25k")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1001003933641105")
+
+# --- 1. CAPA DE RED, CACHÉ Y TELEGRAM ---
+
+def enviar_alerta_telegram(mensaje):
+    """Envía alertas formateadas en HTML a Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram token o Chat ID no configurados.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensaje,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logging.info("Alerta de Telegram enviada exitosamente.")
+        else:
+            logging.error(f"Error al enviar a Telegram ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        logging.error(f"Excepción en envío a Telegram: {e}")
 
 def cargar_cache_disco():
     try:
@@ -45,21 +72,20 @@ def guardar_cache_disco(cache):
         logging.error(f"Error al guardar caché en disco: {e}")
 
 def realizar_peticion(url, reintentos=3):
-    """Realiza peticiones HTTP con reintentos, backoff exponencial y rate limiting."""
     backoff = 1.5
     for intento in range(1, reintentos + 1):
         with SEMAFORO_RED:
-            time.sleep(random.uniform(0.1, 0.4))  # Jitter aleatorio
+            time.sleep(random.uniform(0.1, 0.4))
             try:
                 resp = requests.get(url, headers=HEADERS, impersonate="chrome", timeout=10)
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code in [403, 429]:
-                    logging.warning(f" [HTTP {resp.status_code}] Rate-limited o Bloqueado en {url}. Intento {intento}/{reintentos}")
+                    logging.warning(f" [HTTP {resp.status_code}] Rate-limit en {url}. Intento {intento}/{reintentos}")
                 else:
                     logging.warning(f" [HTTP {resp.status_code}] Error en respuesta para {url}")
             except Exception as e:
-                logging.error(f"Excepción en petición ({url}): {type(e).__name__} - {e}. Intento {intento}/{reintentos}")
+                logging.error(f"Excepción en petición ({url}): {type(e).__name__} - {e}")
 
         if intento < reintentos:
             time.sleep(backoff)
@@ -76,13 +102,11 @@ def obtener_detalle_evento(event_id, cache_memoria):
         cache_memoria[str(event_id)] = evento
     return evento
 
-# --- 2. ALGORITMOS DE RENDIMIENTO, DECAIMIENTO Y RACHA ---
+# --- 2. ALGORITMOS Y MAPPING DE MERCADOS ---
 
 def analizar_historial_usuario(user_id):
-    """Calcula racha cronológica y aciertos ponderados por decaimiento exponencial."""
     ahora = datetime.datetime.now().timestamp()
     
-    # Verificar Caché TTL en memoria para historial de usuario
     if user_id in CACHE_HISTORIAL_USUARIOS:
         cached = CACHE_HISTORIAL_USUARIOS[user_id]
         if ahora - cached["timestamp"] < (TTL_HISTORIAL_HORAS * 3600):
@@ -90,12 +114,9 @@ def analizar_historial_usuario(user_id):
 
     data = realizar_peticion(f"https://www.sofascore.com/api/v1/user-account/{user_id}/predictions/ended/0")
     if not data:
-        stats_vacias = {"racha_activa": 0, "aciertos_3d": 0, "aciertos_7d": 0, "peso_usuario": 1.0}
-        return stats_vacias
+        return {"racha_activa": 0, "aciertos_3d": 0, "aciertos_7d": 0, "peso_usuario": 1.0}
 
     predicciones = data.get('predictions', [])
-    
-    # Ordenamiento cronológico garantizado (Descendente: más reciente primero)
     predicciones_ordenadas = sorted(
         predicciones, 
         key=lambda x: x.get('event', {}).get('startTimestamp', 0), 
@@ -104,7 +125,7 @@ def analizar_historial_usuario(user_id):
     
     limite_3d = ahora - (3 * 86400)
     limite_7d = ahora - (7 * 86400)
-    tau = 3.5  # Constante de decaimiento en días
+    tau = 3.5
     
     racha_activa = 0
     corte_racha = False
@@ -132,15 +153,13 @@ def analizar_historial_usuario(user_id):
             if ts_evento >= limite_7d:
                 aciertos_7d += 1
                 dias_transcurridos = (ahora - ts_evento) / 86400.0
-                peso_tiempo = math.exp(-dias_transcurridos / tau)
-                score_7d_decaimiento += peso_tiempo
+                score_7d_decaimiento += math.exp(-dias_transcurridos / tau)
                 
                 if ts_evento >= limite_3d:
                     aciertos_3d += 1
         else:
             corte_racha = True
 
-    # Ponderación algorítmica del usuario
     peso_usuario = 1.0 + (racha_activa * 0.3) + (score_7d_decaimiento * 0.15)
     
     resultado = {
@@ -154,7 +173,6 @@ def analizar_historial_usuario(user_id):
     return resultado
 
 def normalizar_mercado_voto(voto_raw, pred_raw):
-    """Mapea predicciones de 1X2, Ambos Anotan (BTTS) y Primer Gol."""
     str_voto = str(voto_raw).upper().strip()
     market_type = pred_raw.get('marketType', '').lower()
     
@@ -166,7 +184,6 @@ def normalizar_mercado_voto(voto_raw, pred_raw):
     return str_voto
 
 def procesar_usuario(item, posicion, ah_ts, cache_eventos):
-    """Worker para extraer predicciones de usuario de forma segura."""
     user_data = item.get('user', {})
     user_id = item.get('id') or user_data.get('id')
     username = item.get('username') or user_data.get('username') or f"Usuario {posicion}"
@@ -191,7 +208,8 @@ def procesar_usuario(item, posicion, ah_ts, cache_eventos):
             evento = pred.get('event', {})
             timestamp = evento.get('startTimestamp')
             
-            if timestamp and timestamp < ah_ts:
+            # FILTRADO EXPLÍCITO DE EVENTOS PASADOS
+            if not timestamp or timestamp <= ah_ts:
                 continue
 
             eq_local = evento.get('homeTeam', {}).get('name')
@@ -205,12 +223,13 @@ def procesar_usuario(item, posicion, ah_ts, cache_eventos):
                     eq_visit = evento.get('awayTeam', {}).get('name')
                     timestamp = evento.get('startTimestamp') or timestamp
 
-            if timestamp and timestamp < ah_ts:
+            # Re-verificación tras obtener detalles
+            if not timestamp or timestamp <= ah_ts:
                 continue
 
             partido = f"{eq_local} vs {eq_visit}" if eq_local and eq_visit else "Partido Desconocido"
             torneo = evento.get('tournament', {}).get('name') or "Competición"
-            fecha_str = datetime.datetime.fromtimestamp(timestamp).strftime('%d/%m %H:%M') if timestamp else "Próximamente"
+            fecha_str = datetime.datetime.fromtimestamp(timestamp).strftime('%d/%m %H:%M')
 
             voto_normalizado = normalizar_mercado_voto(pred.get('vote', '?'), pred)
 
@@ -219,7 +238,7 @@ def procesar_usuario(item, posicion, ah_ts, cache_eventos):
                 "info": {
                     "torneo": torneo, 
                     "fecha": fecha_str,
-                    "timestamp": timestamp or 9999999999
+                    "timestamp": timestamp
                 },
                 "prediccion": {
                     "top": posicion,
@@ -267,9 +286,8 @@ h1 { font-size: 1.8em; font-weight: 700; letter-spacing: -0.02em; color: #ffffff
 """
 
 def calcular_consenso_ponderado(predicciones):
-    """Calcula consenso por suma de pesos de usuarios y filtra muestras pequeñas."""
     if len(predicciones) < 3:
-        return "MUESTRA INSUFICIENTE (<3 VOTOS)", "cons-none"
+        return "MUESTRA INSUFICIENTE (<3 VOTOS)", "cons-none", 0, ""
         
     pesos_votos = {}
     peso_total = 0.0
@@ -281,20 +299,18 @@ def calcular_consenso_ponderado(predicciones):
         peso_total += peso
 
     if peso_total == 0:
-        return "SIN CONSENSO", "cons-none"
+        return "SIN CONSENSO", "cons-none", 0, ""
 
     voto_ganador = max(pesos_votos, key=pesos_votos.get)
     porcentaje = int((pesos_votos[voto_ganador] / peso_total) * 100)
 
     if porcentaje >= 55:
-        return f"🔥 {porcentaje}% CONSENSO: {voto_ganador} (N={len(predicciones)})", "cons-active"
+        return f"🔥 {porcentaje}% CONSENSO: {voto_ganador} (N={len(predicciones)})", "cons-active", porcentaje, voto_ganador
     
-    return "SIN CONSENSO CLARO", "cons-none"
+    return "SIN CONSENSO CLARO", "cons-none", porcentaje, voto_ganador
 
 def generar_vistas_html(partidos_top, partidos_rachas):
-    """Genera vistas HTML a partir de datos procesados sin hacer llamadas extra a red."""
-    
-    # --- DASHBOARD TOP ---
+    # DASHBOARD TOP
     html_top = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="300"><title>Radar Top - SofaScore</title><style>{CSS_COMMON}</style></head><body>
     <div class="header-container"><div class="nav-bar"><a href="rachas.html" class="nav-button">🔥 Ver Tipsters en Racha →</a></div><h1>Radar Top Mundial</h1><p class="subtitle">Consenso Ponderado por Confiabilidad</p></div><div class="container">"""
 
@@ -302,7 +318,7 @@ def generar_vistas_html(partidos_top, partidos_rachas):
         html_top += "<div class='empty-state'>No hay predicciones futuras disponibles.</div>"
     else:
         for partido, datos in sorted(partidos_top.items(), key=lambda x: x[1]['info']['timestamp']):
-            texto_cons, clase_cons = calcular_consenso_ponderado(datos['predicciones'])
+            texto_cons, clase_cons, pct, v_gan = calcular_consenso_ponderado(datos['predicciones'])
             html_top += f"""<div class="match-card"><div class="match-header"><span>{datos['info']['torneo']}</span><span>{datos['info']['fecha']}</span></div><div class="match-title">{partido}</div><div class="consensus-badge {clase_cons}">{texto_cons}</div><div class="prediction-list">"""
             for p in datos['predicciones']:
                 html_top += f"""<div class="prediction-badge"><div class="user-info"><span class="top-rank">T{p['top']}</span><span class="user-name" title="{p['usuario']}">{p['usuario']}</span></div><span class="vote">{p['voto']}</span></div>"""
@@ -312,7 +328,7 @@ def generar_vistas_html(partidos_top, partidos_rachas):
     with open("dashboard.html", "w", encoding="utf-8") as f:
         f.write(html_top)
 
-    # --- DASHBOARD RACHAS ---
+    # DASHBOARD RACHAS
     html_rachas = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="300"><title>Radar Rachas - SofaScore</title><style>{CSS_COMMON}</style></head><body>
     <div class="header-container"><div class="nav-bar"><a href="dashboard.html" class="nav-button">← Ver Radar Top General</a></div><h1>Tipsters en Racha</h1><p class="subtitle">Filtrados por algoritmo de decaimiento y rachas activas</p></div><div class="container">"""
 
@@ -330,9 +346,9 @@ def generar_vistas_html(partidos_top, partidos_rachas):
     with open("rachas.html", "w", encoding="utf-8") as f:
         f.write(html_rachas)
 
-    logging.info("Vistas HTML generadas exitosamente.")
+    logging.info("Archivos HTML generados exitosamente.")
 
-# --- 4. PIPELINE Y PERSISTENCIA DE ESTADO ---
+# --- 4. PIPELINE Y LIMPIEZA DE DATOS ---
 
 def ejecutar_pipeline():
     logging.info("Iniciando pipeline de actualización...")
@@ -341,12 +357,13 @@ def ejecutar_pipeline():
     data_ranking = realizar_peticion("https://www.sofascore.com/api/v1/user-account/vote-ranking")
     
     if not data_ranking:
-        logging.error("No se obtuvo el ranking general de SofaScore. Abortando ciclo.")
+        logging.error("No se obtuvo el ranking general de SofaScore. Abortando.")
         return
 
     top_usuarios = data_ranking.get('ranking', [])[:30]
     ahora_ts = datetime.datetime.now().timestamp()
     
+    # REINICIAR ESTRUCTURAS DE DATOS EN CADA CICLO (ELIMINA EVENTOS PASADOS)
     partidos_top = {}
     partidos_rachas = {}
 
@@ -378,30 +395,45 @@ def ejecutar_pipeline():
                         partidos_rachas[partido] = {"info": info, "predicciones": []}
                     partidos_rachas[partido]["predicciones"].append(pred)
 
-    # Persistir caché de eventos en disco
+    # Persistencia de caché de eventos
     guardar_cache_disco(cache_eventos)
 
-    # Persistir estado intermedio en JSON (Separación Datos / Vista)
+    # Sobrescribir state.json SOLO con datos actuales y futuros
     estado = {"top": partidos_top, "rachas": partidos_rachas, "actualizado": ahora_ts}
     try:
         with open("state.json", "w", encoding="utf-8") as f:
             json.dump(estado, f, ensure_ascii=False)
+        logging.info("state.json actualizado y depurado correctamente.")
     except Exception as e:
-        logging.error(f"Error al guardar state.json: {e}")
+        logging.error(f"Error al escribir state.json: {e}")
 
-    # Renderizar HTML
+    # Renderizar plantillas HTML
     generar_vistas_html(partidos_top, partidos_rachas)
+
+    # EVALUAR ALERTAS DE TELEGRAM
+    for partido, datos in partidos_top.items():
+        texto_cons, clase_cons, pct, v_gan = calcular_consenso_ponderado(datos['predicciones'])
+        if pct >= 65:  # Filtro: Notificar consensos a partir de 65%
+            msg = (
+                f"<b>🚨 ALERTA DE CONSENSO DETECTADA</b>\n\n"
+                f"⚽ <b>Partido:</b> {partido}\n"
+                f"🏆 <b>Torneo:</b> {datos['info']['torneo']}\n"
+                f"🕒 <b>Hora:</b> {datos['info']['fecha']}\n\n"
+                f"🔥 <b>Pronóstico:</b> {v_gan} ({pct}% Consenso)\n"
+                f"👥 <b>Votos Top:</b> {len(datos['predicciones'])}\n"
+            )
+            enviar_alerta_telegram(msg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Actualiza los dashboards de SofaScore.")
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Ejecuta un ciclo y termina; útil para GitHub Actions.",
+        help="Ejecuta un ciclo y termina (Ideal para GitHub Actions).",
     )
     args = parser.parse_args()
 
-    INTERVALO_MINUTOS = 240
+    INTERVALO_MINUTOS = 45
     if args.once:
         ejecutar_pipeline()
     else:
