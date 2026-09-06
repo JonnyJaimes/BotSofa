@@ -2,7 +2,7 @@ name: Actualizar dashboards
 
 on:
   schedule:
-    # GitHub Actions usa UTC. Se ejecuta 6 veces al día, cada 4 horas.
+    # Se ejecuta cada 4 horas en UTC
     - cron: "0 */4 * * *"
   workflow_dispatch:
 
@@ -28,22 +28,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Instalar dependencias
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi
 
-      - name: Generar dashboards
-        run: python sofa.py --once
+      - name: Generar dashboards y enviar alertas
+        env:
+          TELEGRAM_TOKEN: "8901055148:AAHea7F6UjSJ8jSnpluKyAsQHoOAxwjb25k"
+          TELEGRAM_CHAT_ID: "-1001003933641105"
+        run: python main.py --once
 
       - name: Publicar cambios generados
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dashboard.html rachas.html
+          git add dashboard.html rachas.html state.json cache_eventos.json
           if git diff --cached --quiet; then
             echo "No hay cambios para publicar."
           else
-            git commit -m "chore: actualizar dashboards"
+            git commit -m "chore: actualizar dashboards y estado"
             git push
           fi
