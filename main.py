@@ -105,8 +105,11 @@ def realizar_peticion(url, reintentos=3):
                 resp = requests.get(url, headers=HEADERS, impersonate="chrome", timeout=10)
                 if resp.status_code == 200:
                     return resp.json()
-                elif resp.status_code in [403, 429]:
-                    logging.warning(f" [HTTP {resp.status_code}] Rate-limit en {url}. Intento {intento}/{reintentos}")
+                elif resp.status_code == 403:
+                    logging.error("[HTTP 403] SofaScore bloqueó esta IP: %s", url)
+                    return None
+                elif resp.status_code == 429:
+                    logging.warning(f" [HTTP 429] Rate-limit en {url}. Intento {intento}/{reintentos}")
                 else:
                     logging.warning(f" [HTTP {resp.status_code}] Error en respuesta para {url}")
             except Exception:
@@ -527,6 +530,9 @@ def ejecutar_pipeline():
     ahora_ts = datetime.datetime.now().timestamp()
     usuarios_seleccionados = seleccionar_usuarios_por_nickname()
     partidos_top, partidos_rachas = recopilar_partidos(usuarios_seleccionados, ahora_ts, cache_eventos)
+    if not partidos_top and not partidos_rachas:
+        logging.error("No se obtuvieron predicciones; se conservan los dashboards anteriores.")
+        return
     guardar_cache_disco(cache_eventos)
     guardar_estado(partidos_top, partidos_rachas, ahora_ts)
     generar_vistas_html(partidos_top, partidos_rachas)
