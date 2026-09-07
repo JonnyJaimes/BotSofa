@@ -547,7 +547,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    INTERVALO_MINUTOS = 5
+    INTERVALO_MINUTOS = 45
     if args.once:
         ejecutar_pipeline()
     else:
