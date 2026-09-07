@@ -33,7 +33,7 @@ CACHE_EVENTOS_FILE = "cache_eventos.json"
 NOTIFICACIONES_FILE = "notificaciones_telegram.json"
 CACHE_HISTORIAL_USUARIOS = {}
 TTL_HISTORIAL_HORAS = 3
-MINUTOS_ANTES_PARTIDO = 10
+MINUTOS_ANTES_PARTIDO = 30
 USUARIOS_OBJETIVO = (
     ("And.A.", "678767edb8435cc2d1bba515"),
     ("Guest623527", "6a50b0b53059489f16131c97"),
@@ -49,11 +49,13 @@ USUARIOS_OBJETIVO = (
 # Configuración de Telegram (Usa variables de entorno o valores por defecto)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+ULTIMO_ENVIO_TELEGRAM = 0.0
 
 # --- 1. CAPA DE RED, CACHÉ Y TELEGRAM ---
 
 def enviar_alerta_telegram(mensaje):
     """Envía alertas formateadas en HTML a Telegram."""
+    global ULTIMO_ENVIO_TELEGRAM
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("Telegram token o Chat ID no configurados.")
         return False
@@ -66,12 +68,24 @@ def enviar_alerta_telegram(mensaje):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        respuesta = resp.json()
-        if resp.status_code == 200 and respuesta.get("ok"):
-            logging.info("Alerta de Telegram enviada exitosamente.")
-            return True
-        else:
+        for intento in range(2):
+            espera = 1.1 - (time.time() - ULTIMO_ENVIO_TELEGRAM)
+            if espera > 0:
+                time.sleep(espera)
+
+            resp = requests.post(url, json=payload, timeout=10)
+            respuesta = resp.json()
+            if resp.status_code == 200 and respuesta.get("ok"):
+                ULTIMO_ENVIO_TELEGRAM = time.time()
+                logging.info("Alerta de Telegram enviada exitosamente.")
+                return True
+
+            if resp.status_code == 429 and intento == 0:
+                retry_after = respuesta.get("parameters", {}).get("retry_after", 1)
+                logging.warning("Telegram limitó el ritmo; reintentando en %s segundos.", retry_after)
+                time.sleep(retry_after + 1)
+                continue
+
             logging.error(
                 "Error al enviar a Telegram (%s): %s",
                 resp.status_code,
@@ -460,13 +474,18 @@ def clave_recordatorio(prediccion, info, partido):
     return f"recordatorio:{clave_notificacion(prediccion, info, partido)}"
 
 def construir_mensaje_predicciones(partido, datos, predicciones, recordatorio=False):
-    nicknames = ", ".join(sorted({prediccion['usuario'] for prediccion in predicciones}))
+    nicknames = ", ".join(
+        f"⭐ <b>TOP {prediccion.get('top', '?')} - {html.escape(prediccion['usuario'])}</b>"
+        if prediccion.get('user_id') == "6a8c9d6dc2e1d8a5b3acc831"
+        else f"TOP {prediccion.get('top', '?')} - {html.escape(prediccion['usuario'])}"
+        for prediccion in sorted(predicciones, key=lambda item: item['usuario'])
+    )
     cuotas = sorted({prediccion.get('cuota', 'No disponible') for prediccion in predicciones})
     cuota = ", ".join(cuotas)
-    titulo = "⏰ PARTIDO EN 10 MINUTOS" if recordatorio else "🔔 NUEVA PREDICCIÓN"
+    titulo = "⏰ PARTIDO PRÓXIMO" if recordatorio else "🔔 NUEVA PREDICCIÓN"
     return (
         f"<b>{titulo}</b>\n\n"
-        f"👤 <b>Nicknames:</b> {html.escape(nicknames)}\n"
+        f"👤 <b>Nicknames:</b> {nicknames}\n"
         f"⚽ <b>Partido:</b> {html.escape(partido)}\n"
         f"🏆 <b>Torneo:</b> {html.escape(datos['info']['torneo'])}\n"
         f"🕒 <b>Hora:</b> {html.escape(datos['info']['fecha'])}\n"
@@ -492,16 +511,21 @@ def procesar_grupo_predicciones(grupo, notificaciones, ahora_ts):
         prediccion for prediccion in predicciones
         if clave_notificacion(prediccion, datos['info'], partido) not in notificaciones
     ]
+    timestamp = datos['info']['timestamp']
+    comienza_pronto = ahora_ts <= timestamp <= ahora_ts + (MINUTOS_ANTES_PARTIDO * 60)
+
     if nuevas:
-        mensaje = construir_mensaje_predicciones(partido, datos, predicciones)
+        mensaje = construir_mensaje_predicciones(
+            partido, datos, predicciones, recordatorio=comienza_pronto
+        )
         if enviar_alerta_telegram(mensaje):
             for prediccion in nuevas:
                 notificaciones.add(clave_notificacion(prediccion, datos['info'], partido))
+                if comienza_pronto:
+                    notificaciones.add(clave_recordatorio(prediccion, datos['info'], partido))
             return True
         return False
 
-    timestamp = datos['info']['timestamp']
-    comienza_pronto = ahora_ts <= timestamp <= ahora_ts + (MINUTOS_ANTES_PARTIDO * 60)
     recordatorio_nuevo = any(
         clave_recordatorio(prediccion, datos['info'], partido) not in notificaciones
         for prediccion in predicciones
@@ -538,6 +562,16 @@ def ejecutar_pipeline():
     generar_vistas_html(partidos_top, partidos_rachas)
     enviar_predicciones(partidos_top, cargar_notificaciones(), ahora_ts)
 
+def esperar_siguiente_revision():
+    ahora = datetime.datetime.now()
+    minutos_hasta_revision = 30 - (ahora.minute % 30)
+    siguiente = (ahora + datetime.timedelta(minutes=minutos_hasta_revision)).replace(
+        second=0, microsecond=0
+    )
+    espera = max((siguiente - ahora).total_seconds(), 1)
+    logging.info("Siguiente revisión local: %s", siguiente.strftime("%H:%M"))
+    time.sleep(espera)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Actualiza los dashboards de SofaScore.")
     parser.add_argument(
@@ -547,11 +581,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    INTERVALO_MINUTOS = 45
     if args.once:
         ejecutar_pipeline()
     else:
         while True:
             ejecutar_pipeline()
-            logging.info(f"Ciclo finalizado. Esperando {INTERVALO_MINUTOS} minutos...")
-            time.sleep(INTERVALO_MINUTOS * 60)
+            esperar_siguiente_revision()
