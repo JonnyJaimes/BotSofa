@@ -9,6 +9,10 @@
     {
       "src": "rachas.html",
       "use": "@vercel/static"
+    },
+    {
+      "src": "favicon.svg",
+      "use": "@vercel/static"
     }
   ],
   "routes": [
